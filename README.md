@@ -116,5 +116,4 @@ This tool is intended for authorized security testing only. Only use it against 
 
 This tool is inspired by and built upon the original work of:
 
-- [sterrasec/dummy](https://github.com/sterrasec/dummy) — original dummy file generator
-
+- [sterrasec/dummy](https://github.com/sterrasec/dummy)
